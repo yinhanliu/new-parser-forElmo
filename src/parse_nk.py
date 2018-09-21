@@ -1,5 +1,5 @@
 import functools
-
+import sys
 import numpy as np
 
 import torch
@@ -23,7 +23,9 @@ import chart_helper
 import nkutil
 
 import trees
-
+sys.path.insert(0, '/private/home/yinhanliu/fairseq_bilstmlm_multitask2')
+from fairseq import data, options, progress_bar, tasks, utils
+from fairseq.data import Dictionary
 START = "<START>"
 STOP = "<STOP>"
 UNK = "<UNK>"
@@ -58,7 +60,7 @@ class BatchIndices:
 
 # %%
 
-class FeatureDropoutFunction(nn.functional._functions.dropout.InplaceFunction):
+class FeatureDropoutFunction(torch.autograd.function.InplaceFunction):
     @classmethod
     def forward(cls, ctx, input, batch_idxs, p=0.5, train=False, inplace=False):
         if p < 0 or p > 1:
@@ -332,7 +334,7 @@ class MultiHeadAttention(nn.Module):
             q_padded, k_padded, v_padded,
             attn_mask=attn_mask,
             )
-        outputs = outputs_padded[output_mask]
+        outputs = outputs_padded[torch.squeeze(output_mask, -1)]
         outputs = self.combine_v(outputs)
 
         outputs = self.residual_dropout(outputs, batch_idxs)
@@ -542,6 +544,8 @@ class CharacterLSTM(nn.Module):
 # %%
 def get_elmo_class():
     # Avoid a hard dependency by only importing Elmo if it's being used
+    import sys
+    sys.path.append('/private/home/yinhanliu/allennlp')
     from allennlp.modules.elmo import Elmo
 
     class ModElmo(Elmo):
@@ -567,15 +571,17 @@ def get_elmo_class():
             """
             # reshape the input if needed
             original_shape = inputs.size()
-            timesteps, num_characters = original_shape[-2:]
-            assert len(original_shape) == 3, "Only 3D tensors supported here"
+            timesteps = original_shape[1]
+            assert len(original_shape) == 2, "Only 2D tensors supported here"
             reshaped_inputs = inputs
 
             # run the biLM
-            bilm_output = self._elmo_lstm(reshaped_inputs)
-            layer_activations = bilm_output['activations']
-            mask_with_bos_eos = bilm_output['mask']
-
+            reshaped_inputs[reshaped_inputs == 0] = 1
+            with torch.no_grad():
+                bilm_output = self._elmo_lstm(reshaped_inputs)
+            
+            layer_activations = bilm_output[1]['inner_states']
+            mask_with_bos_eos = (reshaped_inputs > 1).long()
             # compute the elmo representations
             representations = []
             for i in range(len(self._scalar_mixes)):
@@ -712,13 +718,22 @@ class NKChartParser(nn.Module):
                 hparams.d_char_emb,
                 )
         elif hparams.use_elmo:
+            task = tasks.setup_task(hparams)
+            models, _ = utils.load_ensemble_for_inference(hparams.path.split(':'), task)
+            model = models[0]
+            print (hparams)
+            if hparams.character_embeddings and hasattr(hparams, 'dict'):
+                 task.dictionary = hparams.dict
+                 model.decoder.embed_tokens.set_vocab(hparams.dict, 50)
+            model.eval()
             self.elmo = get_elmo_class()(
-                options_file="data/elmo_2x4096_512_2048cnn_2xhighway_options.json",
-                weight_file="data/elmo_2x4096_512_2048cnn_2xhighway_weights.hdf5",
+                options_file=None,
+                weight_file=None,
                 num_output_representations=1,
                 requires_grad=False,
                 do_layer_norm=False,
                 dropout=hparams.elmo_dropout,
+                module = model,
                 )
             d_elmo_annotations = 1024
 
@@ -763,6 +778,9 @@ class NKChartParser(nn.Module):
 
         if use_cuda:
             self.cuda()
+        
+        self.spec['hparams']['dict'] = Dictionary()
+        self.dict = self.spec['hparams']['dict']
 
     @property
     def model(self):
@@ -914,7 +932,7 @@ class NKChartParser(nn.Module):
             # Sentence start/stop tokens are added inside the ELMo module
             max_sentence_len = max([(len(sentence)) for sentence in sentences])
             max_word_len = 50
-            char_idxs_encoder = np.zeros((len(sentences), max_sentence_len, max_word_len), dtype=int)
+            """char_idxs_encoder = np.zeros((len(sentences), max_sentence_len, max_word_len), dtype=int)
 
             for snum, sentence in enumerate(sentences):
                 for wordnum, (tag, word) in enumerate(sentence):
@@ -932,14 +950,26 @@ class NKChartParser(nn.Module):
                     # +1 for masking (everything that stays 0 is past the end of the sentence)
                     char_idxs_encoder[snum, wordnum, :] += 1
 
-            char_idxs_encoder = Variable(from_numpy(char_idxs_encoder), requires_grad=False)
-
-            elmo_out = self.elmo.forward(char_idxs_encoder)
+            char_idxs_encoder = Variable(from_numpy(char_idxs_encoder), requires_grad=False)"""
+            
+            if self.spec['hparams']['character_embeddings']:
+                 d = self.dict
+                 for sent in sentences:
+                     for t, w in sent:
+                         d.add_symbol(w)
+            else:
+                 d = self.task.src_dict
+            tokens = np.zeros((len(sentences), max_sentence_len+2), dtype=int)
+            for snum, sentence in enumerate(sentences):
+                tokens[snum, 0] = d.eos()
+                for wordnum, (tag, word) in enumerate(sentence, start=1):
+                    tokens[snum, wordnum] = d.index(word)
+                tokens[snum, wordnum+1] = d.eos()
+            tokens = Variable(from_numpy(tokens), requires_grad=False)
+            elmo_out = self.elmo.forward(tokens)
             elmo_rep0 = elmo_out['elmo_representations'][0]
             elmo_mask = elmo_out['mask']
-
-            elmo_annotations_packed = elmo_rep0[elmo_mask.byte().unsqueeze(-1)].view(packed_len, -1)
-
+            elmo_annotations_packed = elmo_rep0[elmo_mask.byte()].view(packed_len, -1)
             # Apply projection to match dimensionality
             extra_content_annotations = self.project_elmo(elmo_annotations_packed)
 

@@ -1,3 +1,4 @@
+import sys
 import argparse
 import itertools
 import os.path
@@ -74,6 +75,16 @@ def make_hparams():
         timing_dropout=0.0,
         char_lstm_input_dropout=0.2,
         elmo_dropout=0.5, # Note that this semi-stacks with morpho_emb_dropout!
+
+        task='language_modeling',
+        fp16=False,
+        vocab='/private/home/yinhanliu/BiLM_Training/vocab-2016-09-10.txt',
+        path='/checkpoint/yinhanliu/20180915/fairseq-lstm-train/layers_6/32_0.001/checkpoint_best.pt',
+        sample_break_mode='eos',
+        raw_text=False,
+        data='/private/home/abaevski/data/gbw',
+        output_dictionary_size=-1,
+        character_embeddings=True,
         )
 
 def run_train(args, hparams):
